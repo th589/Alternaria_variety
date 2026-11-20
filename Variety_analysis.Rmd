@@ -1,0 +1,306 @@
+---
+title: "Variety_analysis"
+author: "Taylere Herrmann"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# 1. Library
+```{r}
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(ggplot2)
+library(lmerTest)   
+library(emmeans)  
+library(multcompView) 
+
+dir.create("output", showWarnings = FALSE)
+```
+
+```{r}
+alpha <- 0.05 
+drop_stunted_head    <- TRUE  
+# drop plots flagged student/straw
+include_castle_dome  <- FALSE  # Fig. 1 caption says Castle Dome is omitted
+# Castle Dome is ommitted 
+use_manuscript_names <- TRUE  
+# data sheets: Astroid / Ekpo / Valleso
+# manuscript:   Asteroid / Expo / Vallejo
+
+maturity_levels <- c("very early", "early", "medium", "late", "very late")
+maturity_labels <- c("Very early\n(<50 DAT)", "Early\n(50-55 DAT)",
+                     "Medium\n(56-60 DAT)", "Late\n(61-65 DAT)",
+                     "Very late\n(>65 DAT)")
+
+```
+
+# 2. Helper Functions
+```{r}
+# Tukey letters from the standard emmeans/multcomp cld(). "a" = lowest mean.
+# Called as multcomp::cld so loading multcomp doesn't mask dplyr::select
+tukey_letters <- function(emm, alpha = 0.05) {
+  cl  <- as.data.frame(multcomp::cld(emm, Letters = letters, adjust = "tukey",
+                                     alpha = alpha))
+  grp <- setNames(trimws(cl$.group), as.character(cl[[1]]))
+  unname(grp[as.character(as.data.frame(emm)[[1]])])
+}
+
+# runs of 3+ are collapsed. Keeps labels short so they fit ex. abcde = a-e
+compress_letters <- function(s, min_run = 3) {
+  vapply(s, function(x) {
+    idx  <- sort(match(strsplit(x, "")[[1]], letters))
+    runs <- split(idx, cumsum(c(1, diff(idx) != 1)))
+    paste(vapply(runs, function(r) {
+      if (length(r) >= min_run) paste0(letters[min(r)], "-", letters[max(r)])
+      else paste(letters[r], collapse = "")
+    }, ""), collapse = ",")
+  }, "", USE.NAMES = FALSE)
+}
+
+# Fit  response ~ variety + (1 | rep), return model, anova and a tidy table
+analyse_one <- function(dat, response) {
+  dat <- dat %>% filter(!is.na(.data[[response]])) %>%
+    mutate(variety = droplevels(factor(variety)))
+  fit <- lmer(as.formula(paste(response, "~ variety + (1 | rep)")), data = dat)
+  emm <- emmeans(fit, ~ variety)
+  tab <- as.data.frame(emm) %>%
+    mutate(letters_full = tukey_letters(emm, alpha),
+           letters      = compress_letters(letters_full),
+           n            = as.vector(table(dat$variety)[as.character(variety)]))
+  list(fit = fit, anova = anova(fit), emm = emm, table = tab, data = dat)
+}
+```
+
+# 3. Data
+```{r}
+d <- read.csv("~/Library/CloudStorage/OneDrive-Personal/R/Alternaria variety/data/variety 2021-2022 no BC 1611.csv", strip.white = TRUE,
+              fileEncoding = "UTF-8-BOM") # BOM otherwise breaks 'Year'
+d$variety <- trimws(d$variety)
+
+if (use_manuscript_names) {
+  fix <- c("Astroid" = "Asteroid", "Ekpo" = "Expo", "Valleso" = "Vallejo")
+  d$variety <- ifelse(d$variety %in% names(fix), fix[d$variety], d$variety)
+}
+
+# Maturity group = 2022 heading class, one value per cultivar
+mat_map <- c(ex_early = "very early", early = "early", medium = "medium",
+             late = "late", ex_late = "very late")
+maturity <- d %>% filter(Year == 2022) %>%
+  count(variety, heading) %>% group_by(variety) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  transmute(variety, maturity = factor(mat_map[heading], levels = maturity_levels))
+
+```
+
+# 4. AUDPC
+
+## 4.1 Leaf AUDPC 2022 from raw ratings
+```{r}
+leaf_days_2022 <- c(0, 5, 11, 16, 21)
+
+audpc <- function(y, t) {       
+  if (any(is.na(y))) return(NA)   
+  sum(diff(t) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+raw_leaf22 <- read_excel("~/Library/CloudStorage/OneDrive-Personal/R/Alternaria variety/data/Variety raw data-2022.xlsx", skip = 3,
+                         col_names = FALSE, na = c("", "NA"))[, c(1, 6:10)]
+names(raw_leaf22) <- c("plot", "l1", "l2", "l3", "l4", "l5")
+raw_leaf22$audpc_new <- apply(raw_leaf22[, 2:6], 1, function(r)
+  audpc(as.numeric(r), leaf_days_2022))
+
+span <- diff(range(leaf_days_2022))          # 21 days
+d <- d %>%
+  left_join(raw_leaf22[, c("plot", "audpc_new")], by = "plot") %>%
+  mutate(
+    # only replace plots the CSV kept (its NAs = stunted / missing plots stay NA)
+    audpcl     = ifelse(Year == 2022 & !is.na(audpcl), audpc_new, audpcl),
+    raudpcl    = ifelse(Year == 2022 & !is.na(raudpcl), audpcl / (span * 100), raudpcl),
+    raudpcl100 = ifelse(Year == 2022 & !is.na(raudpcl100), raudpcl * 100, raudpcl100)
+  ) %>%
+  select(-audpc_new)
+
+d <- d %>% mutate(rep = factor(rep), Year = factor(Year))
+```
+
+## 4.2 Leaf AUDPC --> each year separatly 
+```{r}
+leaf <- lapply(c("2021", "2022"), function(y)
+  analyse_one(d %>% filter(Year == y), "audpcl"))
+names(leaf) <- c("2021", "2022")
+
+```
+
+## 4.3 Year by cultivar interaction 
+Uses relative AUDPC. The two years have different rating windows (69 vs 23) so raw AUDPC isnt comparable between years, but rAUDPC is
+```{r}
+dd <- d %>% filter(variety != "Castle Dome", !is.na(raudpcl100)) %>%
+  mutate(variety = droplevels(factor(variety)))
+fit_int <- lmer(raudpcl100 ~ variety * Year + (1 | Year:rep), data = dd)
+aov_int <- anova(fit_int)
+```
+
+# 5. Figure 1
+```{r}
+fig1_dat <- bind_rows(lapply(names(leaf), function(y)
+  leaf[[y]]$table %>% mutate(Year = y))) %>%
+  left_join(maturity, by = "variety") %>%
+  mutate(upper = emmean + SE)
+
+if (!include_castle_dome) fig1_dat <- filter(fig1_dat, variety != "Castle Dome")
+
+# Order cultivars inside each maturity group by 2022 mean (high -> low)
+ord <- fig1_dat %>% filter(Year == "2022") %>%
+  arrange(maturity, desc(emmean)) %>% pull(variety)
+fig1_dat <- fig1_dat %>%
+  mutate(variety  = factor(variety, levels = ord),
+         maturity = factor(maturity, levels = maturity_levels,
+                           labels = maturity_labels))
+
+ymax1 <- max(fig1_dat$upper) * 1.20
+
+fig1 <- ggplot(fig1_dat, aes(variety, emmean, fill = Year)) +
+  geom_col(position = position_dodge(0.8), width = 0.78) +
+  geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE),
+                position = position_dodge(0.8), width = 0.25, linewidth = 0.3) +
+  # Letters are rotated 90 deg and sit just above each error bar. Stops them from running into neighbors
+  geom_text(aes(y = upper + ymax1 * 0.012, label = letters),
+            position = position_dodge(0.8), angle = 90, hjust = 0, vjust = 0.5, size = 2.6) +
+  facet_grid(~ maturity, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("2021" = "#785EF0" , "2022" = "#FFB000", alpha = 0.7 )) +
+  scale_y_continuous(limits = c(0, ymax1), expand = c(0, 0),
+                     breaks = seq(0, 600, 200)) +
+  labs(x = NULL, y = "Leaf AUDPC", fill = "Year") +
+  theme_classic(base_size = 10) +
+  theme(
+    # angle = 90 + hjust = 1 reads bottom-to-top and ends at the axis
+    # (angle = -90 / 270 is what made the names read 'backwards')
+    axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+    strip.background = element_rect(colour = "black", linewidth = 0.4),
+    strip.text       = element_text(size = 7),
+    panel.spacing.x  = unit(0.12, "in"),
+    legend.position  = "top",
+    legend.justification = "right",
+    legend.key.size  = unit(0.12, "in"),
+    legend.margin    = margin(0, 0, 0, 0)
+  )
+
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path("output", paste0(name, ".png")),  p, width = w, height = h, dpi = 600)
+  ggsave(file.path("output", paste0(name, ".tiff")), p, width = w, height = h,
+         dpi = 600, compression = "lzw")
+}
+save_fig(fig1, "Figure1_leaf_AUDPC", 7, 4.2)
+```
+
+# 6. Head severity
+July 24th 2022
+```{r}
+raw22 <- read_excel("~/Library/CloudStorage/OneDrive-Personal/R/Alternaria variety/data/Variety raw data-2022.xlsx", skip = 3,
+                    col_names = FALSE, na = c("", "NA"))
+names(raw22)[1:23] <- c("plot", "row", "rep", "trt", "variety","leaf_0708", "leaf_0713", "leaf_0719", "leaf_0724", "leaf_0729","audpc_leaf5", "audpc_leaf4",
+  "head_0713", "head_0719", "head_0724", "head_0729", "audpc_head4", "audpc_head3", "maturity_class", "days_after_planting", "days_after_transplant", "stunted", "remark")
+
+head22 <- raw22 %>%
+  mutate(variety = trimws(variety), rep = factor(rep)) %>%
+  filter(variety != "BC 1611")                       # removed from the CSV too
+if (use_manuscript_names) {
+  head22$variety <- ifelse(head22$variety %in% names(fix),
+                           fix[head22$variety], head22$variety)
+}
+head22 <- head22 %>% left_join(maturity, by = "variety")
+
+# Cultivars with no usable head data on July 24:
+#   no head symptoms ever ............ Burgundy, Montebello
+#   symptoms only on the last rating . Vallejo, Diplomat, Imperial (July 29)
+#   no heads formed (very late) ...... Expo, Avenger, Iron man, Marathon
+head_excluded <- c("Burgundy", "Montebello", "Vallejo", "Diplomat", "Imperial")
+head_dat <- head22 %>%
+  filter(!variety %in% head_excluded, maturity != "very late") %>%
+  { if (drop_stunted_head) filter(., is.na(stunted) | stunted != "yes") else . } %>%
+  mutate(severity = head_0724, variety = factor(variety))
+
+head_res <- analyse_one(head_dat, "severity")
+```
+
+## 6.1 Senstivity checks (only if want to report)
+```{r}
+# (a) keep the stunted plots
+head_all <- analyse_one(head22 %>% filter(!variety %in% head_excluded,
+                          maturity != "very late") %>%
+                          mutate(severity = head_0724, variety = factor(variety)),
+                        "severity")
+
+# (b) sqrt transform (severity is a bounded %, with many zeros)
+head_sqrt <- analyse_one(head_dat %>% mutate(severity = sqrt(severity)), "severity")
+```
+
+```{r}
+# Residual diagnostics for the primary model
+png("output/head_model_diagnostics.png", 1600, 800, res = 200)
+op <- par(mfrow = c(1, 2))
+plot(fitted(head_res$fit), resid(head_res$fit), xlab = "Fitted", ylab = "Residual",
+     main = "Residuals vs fitted"); abline(h = 0, lty = 2)
+qqnorm(resid(head_res$fit)); qqline(resid(head_res$fit))
+par(op); dev.off()
+
+```
+
+# 7. Figure 2 
+```{r}
+fig2_dat <- head_res$table %>%
+  left_join(maturity, by = "variety") %>%
+  mutate(upper = emmean + SE) %>%
+  arrange(maturity, desc(emmean))
+fig2_dat <- fig2_dat %>%
+  mutate(variety  = factor(variety, levels = fig2_dat$variety),
+         maturity = factor(maturity, levels = maturity_levels[1:4],
+                           labels = maturity_labels[1:4]))
+
+ymax2 <- max(fig2_dat$upper) * 1.12
+
+fig2 <- ggplot(fig2_dat, aes(variety, emmean)) +
+  geom_col(fill = "#f56103", alpha = 0.7, width = 0.8) +
+  geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE),
+                width = 0.25, linewidth = 0.35) +
+  geom_text(aes(y = upper + ymax2 * 0.012, label = letters),
+            vjust = 0, size = 3) +
+  facet_grid(~ maturity, scales = "free_x", space = "free_x") +
+  scale_y_continuous(limits = c(-5, ymax2), expand = c(0, 0),
+                     breaks = seq(0, 60, 20)) +
+  labs(x = NULL, y = "Final head severity (%)") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8.5),
+        strip.background = element_rect(colour = "black", linewidth = 0.4),
+        strip.text       = element_text(size = 8),
+        panel.spacing.x  = unit(0.12, "in"))
+
+save_fig(fig2, "Figure2_head_severity_July24", 5.5, 3.8)
+```
+
+# 8. Table
+```{r}
+tab_leaf <- bind_rows(lapply(names(leaf), function(y)
+  leaf[[y]]$table %>% mutate(Year = y))) %>%
+  transmute(Year, variety, n, mean = round(emmean, 1), SE = round(SE, 1),
+            letters, letters_full)
+write.csv(tab_leaf, "output/leaf_AUDPC_means_letters.csv", row.names = FALSE)
+
+tab_head <- head_res$table %>% left_join(maturity, by = "variety") %>%
+  transmute(variety, maturity, n, mean = round(emmean, 1), SE = round(SE, 1),
+            letters, letters_full) %>% arrange(desc(mean))
+write.csv(tab_head, "output/head_severity_July24_means_letters.csv", row.names = FALSE)
+
+# One wide table
+table1 <- maturity %>%
+  left_join(tab_leaf %>% filter(Year == "2021") %>%
+              transmute(variety, leaf2021 = mean, l2021 = letters), by = "variety") %>%
+  left_join(tab_leaf %>% filter(Year == "2022") %>%
+              transmute(variety, leaf2022 = mean, l2022 = letters), by = "variety") %>%
+  left_join(tab_head %>% transmute(variety, head0724 = mean, h0724 = letters),
+            by = "variety") %>%
+  arrange(maturity, desc(leaf2022))
+write.csv(table1, "output/Table1_draft.csv", row.names = FALSE, na = "")
+```
+
+
